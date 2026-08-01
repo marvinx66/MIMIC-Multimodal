@@ -1,0 +1,1 @@
+python '1_2 Data Processing Pipeline.py' --input-path ~/MIMICWorkspace/MasterDataset/ --output-pkl-path ~/MIMICWorkspace/BenchmarkDataset/processed_icu_24h.pkl --output-csv-path ~/MIMICWorkspace/BenchmarkDataset/metadata_24h.csv --age-lower 18 --start-diff 0 --end-diff 24
