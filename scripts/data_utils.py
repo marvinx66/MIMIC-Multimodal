@@ -80,6 +80,19 @@ def read_folder(dfs, folder_path):
                 dfs[name] = checked_ddf
                 # update progress
                 pbar.update(1)
+            # Read the file when it ends with csv.gz format and is not already included
+            elif file_name.endswith('.parquet') and file_name[:-7] not in dfs.keys():
+                # extract the name before ".parquet"
+                name = file_name[:-8]  # removing ".parquet" (7 characters) from the file name
+                file_path = os.path.join(folder_path, file_name)
+                # read file
+                ddf = dd.read_parquet(file_path, engine='pyarrow')
+                # check if ddf can be successfully computed
+                checked_ddf = check_ddf(ddf,file_path)
+                # store the dataframe in a dictionary
+                dfs[name] = checked_ddf
+                # update progress
+                pbar.update(1)                
             else:
                 # update progress
                 pbar.update(1)
@@ -101,7 +114,10 @@ def check_ddf(ddf, path):
         match = re.findall(pattern, error_info, re.DOTALL)
         dtype_dict = ast.literal_eval(match[0].split('=')[1].strip())
         # Read the dask dataframe with specified dtypes
-        new_ddf = dd.read_csv(path, compression='gzip',assume_missing=True,dtype=dtype_dict)
+        if path.endswith('.csv.gz'):
+            new_ddf = dd.read_csv(path, compression='gzip',assume_missing=True,dtype=dtype_dict)
+        elif path.endswith('.parquet'):
+            new_ddf = dd.read_parquet(path, engine='pyarrow', dtype=dtype_dict)
         return new_ddf
     
 # Convert time-related variables to datetime type
