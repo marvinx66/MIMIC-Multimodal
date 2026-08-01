@@ -82,11 +82,25 @@ def read_folder(dfs, folder_path):
                 pbar.update(1)
             # Read the file when it ends with csv.gz format and is not already included
             elif file_name.endswith('.parquet') and file_name[:-7] not in dfs.keys():
+
+                # debugging
+                # print(f"Reading {file_name} as dask dataframe")
+                # if file_name != "chartevents.parquet":
+                #     pbar.update(1)   
+                #     continue
+
                 # extract the name before ".parquet"
-                name = file_name[:-8]  # removing ".parquet" (7 characters) from the file name
+                name = file_name[:-8]  # removing ".parquet" (8 characters) from the file name
                 file_path = os.path.join(folder_path, file_name)
                 # read file
-                ddf = dd.read_parquet(file_path, engine='pyarrow')
+                ddf = dd.read_parquet(file_path, engine='pyarrow', split_row_groups=True, aggregate_files=False)
+
+                # debugging
+                # print(f"{file_name} read as dask dataframe with columns: {ddf.columns.tolist()}") 
+                # print(f"File path: {file_path}")
+
+                # safe to avoid memory crash by limiting the partition size to 100MB, which is a reasonable size for most systems
+                ddf = ddf.repartition(partition_size="100MB")
                 # check if ddf can be successfully computed
                 checked_ddf = check_ddf(ddf,file_path)
                 # store the dataframe in a dictionary
@@ -104,7 +118,11 @@ def check_ddf(ddf, path):
     # Errors may be raised when computing dask dataframes
     # Usually this is due to dask's dtype inference failing, and *may* be fixed by specifying dtypes manually
     try:
-        ddf.head(5)
+        # memory crash may occur when computing large dask dataframes, so we limit the number of rows to compute
+        # ddf.head(5)
+
+        # safe to avoid memory crash by limiting the partition size to 100MB, which is a reasonable size for most systems
+        ddf.head(5, npartitions=1)
         return ddf
     except Exception as e:
         # Convert error message to string
