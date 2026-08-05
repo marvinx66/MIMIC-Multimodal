@@ -180,12 +180,26 @@ def load_patient_ICU_objects(folder_path,file_list):
             pbar.update(1)
     return patient_icus
 
+
+def _materialize_patient_icu(patient_ICU):
+    """Compute every dask DataFrame/Series attribute on a Patient_ICU
+    instance to pandas, in place. Safe to call even if some attributes
+    are already pandas (they're left untouched)."""
+    for attr, val in vars(patient_ICU).items():
+        if hasattr(val, "compute"):
+            setattr(patient_ICU, attr, val.compute())
+    return patient_ICU
+
+
 ## Data pre-processing
 def process_patient_ICU(patient_ICU, start_diff, end_diff, tabular_variables, vital_signs_variables, 
                         sorted, ascending):
-        
+
     # Convert tables to pandas dataframes
     patient_ICU.patients = patient_ICU.patients.compute()
+
+    # Debugging: Convert all dask tables on this Patient_ICU to pandas up front
+    # patient_ICU = _materialize_patient_icu(patient_ICU)
     
     ## Extract patient demographics
     tab = patient_ICU.admissions.merge(patient_ICU.patients,how='left',on='subject_id')
@@ -256,7 +270,8 @@ def process_patient_ICU(patient_ICU, start_diff, end_diff, tabular_variables, vi
     image_path = image_path[image_path['dicom_id'].isin(dicom_id_list)]
     images['image_path'] = image_path
     # CXR reports
-    text_path = patient_ICU.cxr_text_path.compute()
+    # debbuging: remove it
+    # text_path = patient_ICU.cxr_text_path.compute()
     text_path = text_path[text_path['study_id'].isin(study_id_list)]
     images['text_path'] = text_path
     
@@ -267,8 +282,9 @@ def process_patient_ICU(patient_ICU, start_diff, end_diff, tabular_variables, vi
     notes['discharge']  = dsnotes
     # radiology reports
     radnotes = patient_ICU.radnotes
-    radnotes = radnotes.drop(columns='subject_id_y')
-    radnotes = radnotes.rename(columns={"subject_id_x": "subject_id"})
+    #debugging
+    # radnotes = radnotes.drop(columns='subject_id_y')
+    # radnotes = radnotes.rename(columns={"subject_id_x": "subject_id"})
     radnotes = radnotes[(radnotes['charttime']>start_time)&(radnotes['charttime']<end_time)]
     if sorted:
         radnotes = radnotes.sort_values(by='charttime',ascending=ascending)
@@ -287,13 +303,18 @@ def cohort_selection(processed_ICU,metadata,age_lower,age_upper,drop_missing_mod
     # Criteria for missing modalities
     drop_missing_ts, drop_missing_img, drop_missing_text = drop_missing_modalities
     ## Time-series
-    missing_ts = processed_ICU.time_series.empty
+    # missing_ts = processed_ICU.time_series.empty
+    missing_ts = len(processed_ICU.time_series.index) == 0
     ts_inclusion = False if missing_ts and drop_missing_ts else True
     ## Image
-    missing_img = processed_ICU.images['metadata'].empty
+    # missing_img = processed_ICU.images['metadata'].empty
+    missing_img = len(processed_ICU.images['metadata'].index) == 0
     img_inclusion = False if missing_img and drop_missing_img else True
     ## Text
-    missing_text = True if processed_ICU.notes['discharge'].empty and processed_ICU.notes['radiology'].empty else False
+    # missing_text = True if processed_ICU.notes['discharge'].empty and processed_ICU.notes['radiology'].empty else False
+    missing_text_discharge = len(processed_ICU.notes['discharge'].index) == 0
+    missing_text_radiology = len(processed_ICU.notes['radiology'].index) == 0
+    missing_text = missing_text_discharge and missing_text_radiology
     text_inclusion = False if missing_text and drop_missing_text else True
     ## Inclusion decision on modality
     modality_inclusion = True if ts_inclusion and img_inclusion and text_inclusion else False
@@ -307,10 +328,16 @@ def cohort_selection(processed_ICU,metadata,age_lower,age_upper,drop_missing_mod
 ## Reshape time series data
 def time_series_reshaping(processed_ICU, vital_signs_variables, ascending):
     # vital signs
-    if not processed_ICU.time_series.empty:
+    if not len(processed_ICU.time_series.index) == 0:
         # Reshape dataframe
         df = processed_ICU.time_series.copy()
+
         df_filtered = df[['hadm_id','stay_id','charttime','label','valuenum']]
+
+        # debugging, convert dask dataframe to pandas dataframe
+        if hasattr(df_filtered, "compute"):
+            df_filtered = df_filtered.compute()
+
         df_pivot = df_filtered.pivot(index=['hadm_id','stay_id','charttime'],columns='label',values='valuenum')
         df_pivot = df_pivot.sort_values(by='charttime',ascending=ascending)
         for var in vital_signs_variables:
@@ -371,7 +398,7 @@ def extract_outcome(icus_metadata,los_range,readmission_range):
         # Find all stays for the same patient after the current stay
         subsequent_stays = icus_metadata[(icus_metadata['subject_id'] == subject_id) & (icus_metadata['intime'] > intime)]
         # Check if any subsequent stay is within 30 days
-        if not subsequent_stays.empty:
+        if not len(subsequent_stays.index) == 0:
             if any((subsequent_stays['intime'] - outtime) <= pd.Timedelta(days=readmission_range)):
                 re_adm = 1
         readmission.append(re_adm)
@@ -426,5 +453,4 @@ def process_all(patient_ICUs,age_lower,age_upper,drop_missing_modalities,los_low
         # Additional outcomes
         patients_metadata = extract_outcome(patients_metadata,los_range,readmission_range)
         patients_metadata = patients_metadata.reset_index(drop=True)
-    return processed_ICUs, patients_metadata         
-
+    return processed_ICUs, patients_metadata
