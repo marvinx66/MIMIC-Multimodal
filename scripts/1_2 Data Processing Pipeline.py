@@ -6,6 +6,8 @@ import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
+from pathlib import Path
+
 # args
 parser = argparse.ArgumentParser()
 
@@ -54,7 +56,7 @@ args = parser.parse_args()
 if __name__ == "__main__":
     
     print(args)
-    input_path = args.input_path
+    input_path = Path(args.input_path).expanduser()
     file_list = os.listdir(input_path)
     """
     --input-path 'D:/Master Dataset/' --output-pkl-path 'Processed Dataset/processed_icu_24h.pkl' 
