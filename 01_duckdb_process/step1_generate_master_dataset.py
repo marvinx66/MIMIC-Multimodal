@@ -235,14 +235,12 @@ def build_list_ids(con, list_ids_path):
 # written straight to parquet. No per-patient loop anywhere below.
 # ---------------------------------------------------------------------------
 
-def _export(con, name, sql, output_dir, overwrite, debug_limit=None):
+def _export(con, name, sql, output_dir, overwrite):
     out_path = output_dir / f"{name}.parquet"
     if out_path.exists() and not overwrite:
         log.info("Skip %s (exists)", name)
         return
     log.info("Exporting %s", name)
-    if debug_limit is not None:
-        sql = f"SELECT * FROM ({sql}) LIMIT {int(debug_limit) * 50}"  # rough cap, see note in main()
     con.execute(f"COPY ({sql}) TO '{out_path.as_posix()}' (FORMAT PARQUET)")
 
 
@@ -253,21 +251,29 @@ def export_master_dataset(con, output_dir, overwrite, debug_limit=None):
     # Deduplicated cohort key tables at each grain -- joining against these
     # (rather than list_ids directly) avoids row duplication from list_ids'
     # one-row-per-(stay, study, note) granularity.
+    #
+    # These MUST be TABLEs, not VIEWs: a view re-evaluates on every query
+    # that references it, and `DISTINCT ... LIMIT n` without ORDER BY has
+    # no defined row order -- so a view would hand a DIFFERENT arbitrary
+    # subset to each export, and the per-table outputs would not share a
+    # common cohort. ORDER BY additionally makes the debug subset
+    # reproducible across runs.
     limit_clause = f"LIMIT {int(debug_limit)}" if debug_limit is not None else ""
     con.execute(f"""
-        CREATE OR REPLACE VIEW key_stay AS
-        SELECT DISTINCT subject_id, hadm_id, stay_id FROM list_ids {limit_clause}
+        CREATE OR REPLACE TABLE key_stay AS
+        SELECT DISTINCT subject_id, hadm_id, stay_id FROM list_ids
+        ORDER BY subject_id, hadm_id, stay_id {limit_clause}
     """)
-    con.execute("CREATE OR REPLACE VIEW key_hadm AS SELECT DISTINCT subject_id, hadm_id FROM key_stay")
-    con.execute("CREATE OR REPLACE VIEW key_subject AS SELECT DISTINCT subject_id FROM key_stay")
-    # Scoped view of list_ids itself -- equals the full list_ids when no
-    # debug_limit is set, or the restricted subset otherwise. CXR/notes
-    # exports join against this instead of list_ids directly, so
-    # --debug-limit actually limits them too.
+    con.execute("CREATE OR REPLACE TABLE key_hadm AS SELECT DISTINCT subject_id, hadm_id FROM key_stay")
+    con.execute("CREATE OR REPLACE TABLE key_subject AS SELECT DISTINCT subject_id FROM key_stay")
+    # Scoped copy of list_ids restricted to the selected cohort. Also a
+    # TABLE, for the same determinism reason as above.
     con.execute("""
-        CREATE OR REPLACE VIEW list_ids_scope AS
+        CREATE OR REPLACE TABLE list_ids_scope AS
         SELECT l.* FROM list_ids l JOIN key_stay k USING (subject_id, hadm_id, stay_id)
     """)
+    n_stays = con.execute("SELECT COUNT(*) FROM key_stay").fetchone()[0]
+    log.info("Cohort for export: %d ICU stays", n_stays)
 
     # ---- Hosp: subject-level ----
     _export(con, "patients", """

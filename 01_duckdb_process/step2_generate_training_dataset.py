@@ -82,8 +82,14 @@ def build_stay_windows(con, start_diff, end_diff, debug_limit=None):
 
     limit_clause = f"LIMIT {int(debug_limit)}" if debug_limit is not None else ""
 
+    # stay_base MUST be a TABLE, not a VIEW: a view re-evaluates on every
+    # referencing query, and `LIMIT n` without ORDER BY has no defined row
+    # order -- so a view would hand a DIFFERENT arbitrary subset of stays
+    # to the time-series join, the CXR join, the cohort filter, and the
+    # final export, and they would not agree on a common cohort.
+    # ORDER BY additionally makes the debug subset reproducible.
     con.execute(f"""
-        CREATE OR REPLACE VIEW stay_base AS
+        CREATE OR REPLACE TABLE stay_base AS
         SELECT
             a.subject_id, a.hadm_id, i.stay_id,
             a.admission_type, a.admission_location, a.discharge_location,
@@ -98,6 +104,7 @@ def build_stay_windows(con, start_diff, end_diff, debug_limit=None):
         FROM icustays i
         JOIN admissions a USING (subject_id, hadm_id)
         JOIN patients p USING (subject_id)
+        ORDER BY i.stay_id
         {limit_clause}
     """)
 
@@ -117,10 +124,12 @@ def build_stay_windows(con, start_diff, end_diff, debug_limit=None):
     end_expr = "outtime" if end_diff is None else f"LEAST(intime + INTERVAL '{end_diff} hours', outtime)"
 
     con.execute(f"""
-        CREATE OR REPLACE VIEW stay_windows AS
+        CREATE OR REPLACE TABLE stay_windows AS
         SELECT *, {start_expr} AS start_time, {end_expr} AS end_time
         FROM stay_base
     """)
+    n_stays = con.execute("SELECT COUNT(*) FROM stay_windows").fetchone()[0]
+    log.info("stay_windows: %d ICU stays", n_stays)
 
 
 # ---------------------------------------------------------------------------

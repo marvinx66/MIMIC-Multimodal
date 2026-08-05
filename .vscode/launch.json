@@ -63,7 +63,7 @@
         "--cxr-path", "${env:HOME}/MIMICWorkspace/MIMIC-CXR/2.1.0/",
         "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
         "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
-        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_0805/"
+        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_0805/",
       ]
     },
     {
@@ -80,7 +80,8 @@
         "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
         "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
         "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_debug/",
-        "--debug-limit", "10"
+        "--debug-limit", "100",
+        "--overwrite"
       ]
     },  
     {
@@ -122,7 +123,7 @@
         "--end-diff",
         "24",
         "--debug-limit",
-        "10"
+        "100"
       ]
     }
   ]
