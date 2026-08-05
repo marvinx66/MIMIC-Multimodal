@@ -80,7 +80,16 @@ def create_views_for_folder(con, folder_path, cast_datetimes):
 
         if file_name.endswith(".csv.gz"):
             table = file_name[: -len(".csv.gz")]
-            read_expr = f"read_csv_auto('{file_path.as_posix()}', compression='gzip')"
+            # quote is specified explicitly rather than left to auto-detection:
+            # DuckDB samples only the first ~20k rows to guess CSV dialect, and
+            # if that sample happens to contain few/no quoted fields it can
+            # conclude quote='' -- then a later row with an embedded comma
+            # inside real quotes (e.g. "RIB, UNILAT (NO CXR)") gets split into
+            # the wrong number of columns.
+            read_expr = (
+                f"read_csv_auto('{file_path.as_posix()}', compression='gzip', "
+                f"quote='\"', escape='\"')"
+            )
         elif file_name.endswith(".parquet"):
             table = file_name[: -len(".parquet")]
             read_expr = f"read_parquet('{file_path.as_posix()}')"
@@ -222,8 +231,21 @@ def build_list_ids(con, list_ids_path):
 # Per-patient extraction
 # ---------------------------------------------------------------------------
 
+def _native(v):
+    """Convert a numpy/pandas scalar to a plain Python type. DuckDB's
+    parameter binder accepts plain Python int/float/str reliably but can
+    raise NotImplementedException on numpy scalar types (numpy.int64,
+    numpy.float64, etc.) depending on context -- safest to always convert
+    before binding, rather than rely on it working incidentally."""
+    return v.item() if hasattr(v, "item") else v
+
+
+def _native_list(values):
+    return [_native(v) for v in values]
+
+
 def _fetch(con, table, where_sql, params):
-    return con.execute(f'SELECT * FROM "{table}" WHERE {where_sql}', params).df()
+    return con.execute(f'SELECT * FROM "{table}" WHERE {where_sql}', _native_list(params)).df()
 
 
 def _fetch_by_ids(con, table, id_col, ids):
@@ -231,7 +253,7 @@ def _fetch_by_ids(con, table, id_col, ids):
     keys collected from an already-filtered parent table (e.g. emar_detail
     scoped to one patient's emar_id values). Avoids ever loading the full
     detail table into memory."""
-    ids = [i for i in pd.unique(ids) if pd.notna(i)]
+    ids = _native_list(i for i in pd.unique(ids) if pd.notna(i))
     if not ids:
         return con.execute(f'SELECT * FROM "{table}" WHERE 1=0').df()
     placeholders = ", ".join(["?"] * len(ids))
@@ -242,9 +264,9 @@ def _fetch_by_id_list(con, table, subject_col, subject_id, id_cols_and_lists):
     """Fetch rows matching subject_id plus one or more IN-list filters,
     e.g. CXR tables filtered by subject_id + study_id (+ dicom_id)."""
     clauses = [f'"{subject_col}" = ?']
-    params = [subject_id]
+    params = [_native(subject_id)]
     for col, values in id_cols_and_lists:
-        values = [v for v in pd.unique(values) if pd.notna(v)]
+        values = _native_list(v for v in pd.unique(values) if pd.notna(v))
         if not values:
             return con.execute(f'SELECT * FROM "{table}" WHERE 1=0').df()
         clauses.append(f'"{col}" IN ({", ".join(["?"] * len(values))})')
@@ -296,6 +318,10 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
     against DuckDB views over the source parquet/csv.gz files, since they're
     too large to hold fully in memory. Output structure matches the
     original Patient_ICU exactly."""
+
+    key_subject_id = _native(key_subject_id)
+    key_hadm_id = _native(key_hadm_id)
+    key_stay_id = _native(key_stay_id)
 
     df_core = _fetch(con, "list_ids", "subject_id = ? AND hadm_id = ? AND stay_id = ?",
                       [key_subject_id, key_hadm_id, key_stay_id])
@@ -370,8 +396,8 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
         con, "cxr-study-list", "subject_id", key_subject_id,
         [("study_id", study_id_list)],
     )
-    study_ids = [v for v in pd.unique(study_id_list) if pd.notna(v)]
-    dicom_ids = [v for v in pd.unique(dicom_id_list) if pd.notna(v)]
+    study_ids = _native_list(v for v in pd.unique(study_id_list) if pd.notna(v))
+    dicom_ids = _native_list(v for v in pd.unique(dicom_id_list) if pd.notna(v))
     if study_ids and dicom_ids:
         placeholders_s = ", ".join(["?"] * len(study_ids))
         placeholders_d = ", ".join(["?"] * len(dicom_ids))
