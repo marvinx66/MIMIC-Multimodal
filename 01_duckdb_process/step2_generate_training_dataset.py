@@ -45,6 +45,15 @@ DEFAULT_TABULAR_VARIABLES = [
     "subject_id", "hadm_id", "stay_id", "age", "gender", "race",
     "marital_status", "language", "insurance",
 ]
+# The 14 CheXpert/NegBio finding labels. Both labelers use these exact
+# column names, so each must be explicitly prefixed on join.
+CXR_LABELS = [
+    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
+    "Enlarged Cardiomediastinum", "Fracture", "Lung Lesion", "Lung Opacity",
+    "No Finding", "Pleural Effusion", "Pleural Other", "Pneumonia",
+    "Pneumothorax", "Support Devices",
+]
+
 DEFAULT_VITAL_SIGNS_VARIABLES = [
     "Heart Rate", "Respiratory Rate", "O2 saturation pulseoxymetry",
     "Non Invasive Blood Pressure systolic", "Non Invasive Blood Pressure diastolic",
@@ -182,13 +191,20 @@ def build_time_series(con, vital_signs_variables):
 # ---------------------------------------------------------------------------
 
 def build_cxr_index(con):
+    # list_ids has one row per (stay, study, note) combination, so joining
+    # it directly fans out one CXR study into many rows. Dedupe the
+    # stay<->image mapping first.
+    con.execute("""
+        CREATE OR REPLACE TABLE cxr_stay_map AS
+        SELECT DISTINCT stay_id, subject_id, study_id, dicom_id
+        FROM list_ids
+        WHERE stay_id IS NOT NULL AND study_id IS NOT NULL AND dicom_id IS NOT NULL
+    """)
     con.execute("""
         CREATE OR REPLACE VIEW cxr_with_stay AS
         SELECT l.stay_id, m.*
         FROM cxr_metadata m
-        JOIN list_ids l ON m.subject_id = l.subject_id
-            AND m.study_id = l.study_id AND m.dicom_id = l.dicom_id
-        WHERE l.stay_id IS NOT NULL
+        JOIN cxr_stay_map l USING (subject_id, study_id, dicom_id)
     """)
     con.execute("""
         CREATE OR REPLACE VIEW cxr_windowed AS
@@ -197,14 +213,21 @@ def build_cxr_index(con):
         JOIN stay_windows w USING (stay_id)
         WHERE c.StudyDatetime > w.start_time AND c.StudyDatetime < w.end_time
     """)
-    con.execute("""
+    # CheXpert and NegBio share all 14 label column names. Left unqualified,
+    # DuckDB silently auto-suffixes the second set (Atelectasis /
+    # Atelectasis_1) and you can't tell which labeler is which -- so
+    # prefix them explicitly instead.
+    chexpert_cols = ", ".join(f'ch."{lbl}" AS "chexpert_{lbl}"' for lbl in CXR_LABELS)
+    negbio_cols = ", ".join(f'nb."{lbl}" AS "negbio_{lbl}"' for lbl in CXR_LABELS)
+
+    con.execute(f"""
         CREATE OR REPLACE VIEW cxr_index_full AS
         SELECT
             c.*,
             ip.path AS image_path,
             tp.path AS text_path,
-            ch.* EXCLUDE (subject_id, study_id),
-            nb.* EXCLUDE (subject_id, study_id)
+            {chexpert_cols},
+            {negbio_cols}
         FROM cxr_windowed c
         LEFT JOIN cxr_image_path ip ON c.subject_id = ip.subject_id
             AND c.study_id = ip.study_id AND c.dicom_id = ip.dicom_id
@@ -222,21 +245,58 @@ def build_cxr_index(con):
 # ---------------------------------------------------------------------------
 
 def build_notes(con):
+    # list_ids has one row per (stay, study, note) combination, so a single
+    # note_id matches MANY list_ids rows -- joining it directly fans one
+    # note out into dozens of duplicate rows. Dedupe the mapping first.
     con.execute("""
-        CREATE OR REPLACE VIEW notes_discharge_full AS
-        SELECT l.stay_id, d.*
-        FROM dsnotes d
-        JOIN list_ids l ON d.subject_id = l.subject_id AND d.hadm_id = l.hadm_id
-            AND d.note_id = l.ds_note_id
-        WHERE l.stay_id IS NOT NULL
+        CREATE OR REPLACE TABLE ds_stay_map AS
+        SELECT DISTINCT stay_id, subject_id, hadm_id, ds_note_id AS note_id
+        FROM list_ids
+        WHERE stay_id IS NOT NULL AND ds_note_id IS NOT NULL
     """)
     con.execute("""
+        CREATE OR REPLACE TABLE rad_stay_map AS
+        SELECT DISTINCT stay_id, subject_id, hadm_id, rad_note_id AS note_id
+        FROM list_ids
+        WHERE stay_id IS NOT NULL AND rad_note_id IS NOT NULL
+    """)
+
+    con.execute("""
+        CREATE OR REPLACE VIEW notes_discharge_full AS
+        SELECT m.stay_id, d.*
+        FROM dsnotes d
+        JOIN ds_stay_map m USING (subject_id, hadm_id, note_id)
+    """)
+
+    # radnotes carries radiology_detail's one-row-per-field fan-out
+    # (field_name/field_value/field_ordinal, up to ~15 rows per note).
+    # Collapse back to one row per note, keeping the detail fields as an
+    # ordered list of structs. A MAP won't work here: the same field_name
+    # can repeat within a note (distinguished only by field_ordinal), and
+    # MAP requires unique keys.
+    rad_cols = set(con.execute("SELECT * FROM radnotes LIMIT 0").df().columns)
+    detail_cols = {"field_name", "field_value", "field_ordinal"}
+    if detail_cols & rad_cols:
+        keep = [c for c in rad_cols if c not in detail_cols]
+        keep_sql = ", ".join(f'r."{c}"' for c in keep)
+        con.execute(f"""
+            CREATE OR REPLACE VIEW radnotes_dedup AS
+            SELECT {keep_sql},
+                   LIST({{'name': r.field_name,
+                          'value': r.field_value,
+                          'ordinal': r.field_ordinal}}
+                        ORDER BY r.field_ordinal) AS detail_fields
+            FROM radnotes r
+            GROUP BY {keep_sql}
+        """)
+    else:
+        con.execute("CREATE OR REPLACE VIEW radnotes_dedup AS SELECT * FROM radnotes")
+
+    con.execute("""
         CREATE OR REPLACE VIEW radnotes_with_stay AS
-        SELECT l.stay_id, r.*
-        FROM radnotes r
-        JOIN list_ids l ON r.subject_id = l.subject_id AND r.hadm_id = l.hadm_id
-            AND r.note_id = l.rad_note_id
-        WHERE l.stay_id IS NOT NULL
+        SELECT m.stay_id, r.*
+        FROM radnotes_dedup r
+        JOIN rad_stay_map m USING (subject_id, hadm_id, note_id)
     """)
     con.execute("""
         CREATE OR REPLACE VIEW notes_radiology_full AS
@@ -425,6 +485,25 @@ def main():
 
     log.info("Exporting training dataset to %s", args.output_dir)
     export_training_dataset(con, args.output_dir, args.tabular_variables)
+
+    # Sanity summary: rows per table and rows-per-stay. A ratio far above
+    # what the grain implies (e.g. ~25 discharge notes per stay) means a
+    # join is fanning out rows.
+    n_stays = con.execute("SELECT COUNT(*) FROM included_stays").fetchone()[0]
+    for name, view, key in [
+        ("tabular", "stay_windows w JOIN included_stays i USING (stay_id)", "stay_id"),
+        ("time_series", "time_series_full t JOIN included_stays i USING (stay_id)", "stay_id"),
+        ("cxr_index", "cxr_index_full c JOIN included_stays i USING (stay_id)", "dicom_id"),
+        ("notes_discharge", "notes_discharge_full d JOIN included_stays i USING (stay_id)", "note_id"),
+        ("notes_radiology", "notes_radiology_full r JOIN included_stays i USING (stay_id)", "note_id"),
+    ]:
+        rows, distinct = con.execute(
+            f"SELECT COUNT(*), COUNT(DISTINCT {key}) FROM {view}"
+        ).fetchone()
+        ratio = rows / n_stays if n_stays else 0
+        flag = "  <-- CHECK: rows > distinct keys, possible fan-out" if rows > distinct else ""
+        log.info("  %-16s rows=%-8d distinct %s=%-8d rows/stay=%.1f%s",
+                 name, rows, key, distinct, ratio, flag)
 
     log.info("Done.")
 
