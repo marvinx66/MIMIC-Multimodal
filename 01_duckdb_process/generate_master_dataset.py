@@ -17,17 +17,19 @@ Source data:
   MIMIC-IV-Note   https://physionet.org/content/mimic-iv-note/2.2/note/
 
 Usage:
-python generate_master_dataset.py \
-  --hosp-path ~/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/hosp/ \
-  --icu-path ~/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/icu/ \
-  --cxr-path ~/MIMICWorkspace/MIMIC-CXR/2.1.0/ \
-  --cxr-jpg-path ~/MIMICWorkspace/mimic-cxr-jpg/2.1.0/ \
-  --note-path ~/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/ \
-  --db-path ~/MIMICWorkspace/mimic.duckdb \
-  --output-dir ~/MIMICWorkspace/MasterDataset/
+    python generate_master_dataset.py \\
+        --hosp-path ~/MIMICWorkspace/MIMIC-IV-Parquet/.../hosp/ \\
+        --icu-path  ~/MIMICWorkspace/MIMIC-IV-Parquet/.../icu/ \\
+        --cxr-path  ~/MIMICWorkspace/MIMIC-CXR/2.1.0/ \\
+        --cxr-jpg-path ~/MIMICWorkspace/mimic-cxr-jpg/2.1.0/ \\
+        --note-path ~/MIMICWorkspace/MIMIC-IV-Note-Parquet/.../note/ \\
+        --output-dir ~/MIMICWorkspace/MasterDataset/
 
-Re-running is safe: source folders are only re-ingested if --rebuild-db is
-passed, and patient pickles that already exist in --output-dir are skipped
+No database file is created -- DuckDB reads your source parquet/csv.gz
+files in place via SQL views. The only new files ever written are
+list_ids.parquet and cxr_study_datetime.parquet (small derived data that
+doesn't exist in the source files). Re-running is safe: those two files
+and patient pickles that already exist in --output-dir are all skipped,
 so an interrupted run can simply be re-launched to resume.
 """
 
@@ -48,7 +50,10 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Ingestion: source folders -> indexed DuckDB tables
+# Views: zero-copy access to source folders -- DuckDB never stores a copy
+# of this data. Every query reads directly from the original parquet /
+# csv.gz files on disk, exactly like your data_utils.py Patient_ICU dict
+# structure did, just via SQL instead of dask.
 # ---------------------------------------------------------------------------
 
 # Time-like column keywords, applied only to hosp/icu/note tables (matches
@@ -56,132 +61,91 @@ log = logging.getLogger(__name__)
 # use a different int/float encoding and are handled separately below.
 _TIME_KEYWORDS = ("time", "date", "dod")
 
-# subject_id / hadm_id / stay_id columns used for per-patient lookups.
-# Only these get indexed -- keeps ingestion fast.
-_HOSP_INDEX_COLS = {
-    "admissions": ["subject_id", "hadm_id"],
-    "patients": ["subject_id"],
-    "transfers": ["subject_id", "hadm_id"],
-    "diagnoses_icd": ["subject_id", "hadm_id"],
-    "procedures_icd": ["subject_id", "hadm_id"],
-    "drgcodes": ["subject_id", "hadm_id"],
-    "services": ["subject_id", "hadm_id"],
-    "labevents": ["subject_id", "hadm_id"],
-    "hcpcsevents": ["subject_id", "hadm_id"],
-    "microbiologyevents": ["subject_id", "hadm_id"],
-    "emar": ["subject_id", "hadm_id"],
-    "emar_detail": ["emar_id"],
-    "poe": ["subject_id", "hadm_id"],
-    "poe_detail": ["poe_id"],
-    "prescriptions": ["subject_id", "hadm_id"],
-    "pharmacy": ["pharmacy_id"],
-}
-_ICU_INDEX_COLS = {
-    "icustays": ["subject_id", "hadm_id", "stay_id"],
-    "procedureevents": ["subject_id", "hadm_id", "stay_id"],
-    "outputevents": ["subject_id", "hadm_id", "stay_id"],
-    "inputevents": ["subject_id", "hadm_id", "stay_id"],
-    "datetimeevents": ["subject_id", "hadm_id", "stay_id"],
-    "chartevents": ["subject_id", "hadm_id", "stay_id"],
-    "ingredientevents": ["subject_id", "hadm_id", "stay_id"],
-}
-_CXR_INDEX_COLS = {
-    "cxr-record-list": ["subject_id", "study_id", "dicom_id"],
-    "cxr-study-list": ["subject_id", "study_id"],
-}
-_CXR_JPG_INDEX_COLS = {
-    "mimic-cxr-2.0.0-metadata": ["subject_id", "study_id", "dicom_id"],
-    "mimic-cxr-2.0.0-chexpert": ["subject_id", "study_id"],
-    "mimic-cxr-2.0.0-negbio": ["subject_id", "study_id"],
-    "mimic-cxr-2.0.0-split": ["subject_id", "study_id", "dicom_id"],
-}
-_NOTE_INDEX_COLS = {
-    "discharge": ["subject_id", "hadm_id", "note_id"],
-    "radiology": ["subject_id", "hadm_id", "note_id"],
-    "radiology_detail": ["note_id"],
-}
+
+def _source_columns(con, read_expr):
+    """Cheap column-name lookup without reading the file's data rows."""
+    return con.execute(f"SELECT * FROM {read_expr} LIMIT 0").df().columns.tolist()
 
 
-def _cast_time_columns(con, table):
-    """Cast columns whose name suggests a date/time value to TIMESTAMP,
-    matching the original per-folder convert_datetime() heuristic."""
-    cols = con.execute(f'PRAGMA table_info("{table}")').fetchdf()["name"].tolist()
-    to_cast = [c for c in cols if any(w in c.lower() for w in _TIME_KEYWORDS)]
-    if not to_cast:
-        return
-    select_parts = [
-        f'TRY_CAST("{c}" AS TIMESTAMP) AS "{c}"' if c in to_cast else f'"{c}"'
-        for c in cols
-    ]
-    con.execute(f'CREATE OR REPLACE TABLE "{table}" AS SELECT {", ".join(select_parts)} FROM "{table}"')
-
-
-def ingest_folder(con, folder_path, index_cols, cast_datetimes):
-    """Read every .csv.gz / .parquet file in folder_path into a DuckDB
-    table named after the file stem, then index and (optionally) cast
-    time-like columns."""
+def create_views_for_folder(con, folder_path, cast_datetimes):
+    """Define a SQL VIEW over every .csv.gz / .parquet file in folder_path,
+    named after the file stem (mirrors the original dfs[name] dict keys).
+    No data is copied or written to disk -- each view reads the source
+    file directly at query time."""
     folder_path = Path(folder_path)
     file_list = sorted(os.listdir(folder_path))
 
-    for file_name in tqdm(file_list, desc=f"Ingest {folder_path.name}"):
+    for file_name in tqdm(file_list, desc=f"Register views: {folder_path.name}"):
         file_path = folder_path / file_name
 
         if file_name.endswith(".csv.gz"):
             table = file_name[: -len(".csv.gz")]
-            con.execute(f"""
-                CREATE OR REPLACE TABLE "{table}" AS
-                SELECT * FROM read_csv_auto('{file_path.as_posix()}', compression='gzip')
-            """)
+            read_expr = f"read_csv_auto('{file_path.as_posix()}', compression='gzip')"
         elif file_name.endswith(".parquet"):
             table = file_name[: -len(".parquet")]
-            con.execute(f"""
-                CREATE OR REPLACE TABLE "{table}" AS
-                SELECT * FROM read_parquet('{file_path.as_posix()}')
-            """)
+            read_expr = f"read_parquet('{file_path.as_posix()}')"
         else:
             continue
 
         if cast_datetimes:
-            _cast_time_columns(con, table)
+            cols = _source_columns(con, read_expr)
+            to_cast = [c for c in cols if any(w in c.lower() for w in _TIME_KEYWORDS)]
+            select_parts = [
+                f'TRY_CAST("{c}" AS TIMESTAMP) AS "{c}"' if c in to_cast else f'"{c}"'
+                for c in cols
+            ]
+            select_sql = ", ".join(select_parts)
+        else:
+            select_sql = "*"
 
-        cols = index_cols.get(table)
-        if cols:
-            idx_name = f"idx_{table.replace('-', '_')}_{'_'.join(cols)}"
-            con.execute(f'CREATE INDEX IF NOT EXISTS {idx_name} ON "{table}" ({", ".join(cols)})')
-
-
-def fix_cxr_metadata_datetime(con):
-    """Build StudyDatetime from CXR-JPG's int-encoded StudyDate/StudyTime
-    columns. Done in pandas (small table, ~fixed-size per MIMIC-CXR-JPG
-    release) then written back to DuckDB."""
-    df = con.execute('SELECT * FROM "mimic-cxr-2.0.0-metadata"').df()
-    df["StudyDate"] = df["StudyDate"].astype(int)
-    df["StudyDate"] = pd.to_datetime(df["StudyDate"], format="%Y%m%d")
-    df["StudyTime"] = df["StudyTime"].apply(lambda t: "%#010.3f" % t)
-    df["StudyTime"] = pd.to_datetime(df["StudyTime"], format="%H%M%S.%f").dt.strftime("%H%M%S")
-    df["StudyTime"] = pd.to_datetime(df["StudyTime"], format="%H%M%S").dt.time
-    df["StudyDatetime"] = df.apply(lambda r: pd.Timestamp.combine(r["StudyDate"], r["StudyTime"]), axis=1)
-
-    con.register("cxr_metadata_fixed", df)
-    con.execute('CREATE OR REPLACE TABLE "mimic-cxr-2.0.0-metadata" AS SELECT * FROM cxr_metadata_fixed')
-    con.unregister("cxr_metadata_fixed")
-
-    idx_name = "idx_cxr_metadata_subject_study_dicom"
-    con.execute(f'CREATE INDEX IF NOT EXISTS {idx_name} ON "mimic-cxr-2.0.0-metadata" (subject_id, study_id, dicom_id)')
+        con.execute(f'CREATE OR REPLACE VIEW "{table}" AS SELECT {select_sql} FROM {read_expr}')
 
 
-def build_database(db_path, hosp_path, icu_path, cxr_path, cxr_jpg_path, note_path):
-    """One-time ingestion of every source folder into an indexed DuckDB
-    database file."""
-    con = duckdb.connect(str(db_path))
+def build_cxr_study_datetime(con, cxr_datetime_path):
+    """Compute StudyDatetime from CXR-JPG's int-encoded StudyDate/StudyTime
+    columns and persist ONLY the derived column plus keys as a small new
+    parquet file -- not a copy of the full metadata table. Everything else
+    about a CXR study is still read from the original metadata file via
+    its view; this file only adds the one column that doesn't exist yet."""
+    if cxr_datetime_path.exists():
+        log.info("Reusing existing cxr_study_datetime at %s", cxr_datetime_path)
+    else:
+        log.info("Computing cxr_study_datetime -> %s", cxr_datetime_path)
+        df = con.execute(
+            'SELECT subject_id, study_id, dicom_id, "StudyDate", "StudyTime" FROM "mimic-cxr-2.0.0-metadata"'
+        ).df()
+        df["StudyDate"] = df["StudyDate"].astype(int)
+        study_date = pd.to_datetime(df["StudyDate"], format="%Y%m%d")
+        study_time_str = df["StudyTime"].apply(lambda t: "%#010.3f" % t)
+        study_time_str = pd.to_datetime(study_time_str, format="%H%M%S.%f").dt.strftime("%H%M%S")
+        study_time = pd.to_datetime(study_time_str, format="%H%M%S").dt.time
+        study_datetime = [pd.Timestamp.combine(d, t) for d, t in zip(study_date, study_time)]
 
-    ingest_folder(con, hosp_path, _HOSP_INDEX_COLS, cast_datetimes=True)
-    ingest_folder(con, icu_path, _ICU_INDEX_COLS, cast_datetimes=True)
-    ingest_folder(con, cxr_path, _CXR_INDEX_COLS, cast_datetimes=False)
-    ingest_folder(con, cxr_jpg_path, _CXR_JPG_INDEX_COLS, cast_datetimes=False)
-    ingest_folder(con, note_path, _NOTE_INDEX_COLS, cast_datetimes=True)
+        out = df[["subject_id", "study_id", "dicom_id"]].copy()
+        out["StudyDatetime"] = study_datetime
 
-    fix_cxr_metadata_datetime(con)
+        cxr_datetime_path.parent.mkdir(parents=True, exist_ok=True)
+        out.to_parquet(cxr_datetime_path, index=False)
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW cxr_study_datetime AS
+        SELECT * FROM read_parquet('{cxr_datetime_path.as_posix()}')
+    """)
+
+
+def register_views(hosp_path, icu_path, cxr_path, cxr_jpg_path, note_path, cxr_datetime_path):
+    """Connect an in-memory DuckDB instance and register views over every
+    source file. Cheap to call every run -- no data is read or written
+    until a query actually touches a view."""
+    con = duckdb.connect(":memory:")
+
+    create_views_for_folder(con, hosp_path, cast_datetimes=True)
+    create_views_for_folder(con, icu_path, cast_datetimes=True)
+    create_views_for_folder(con, cxr_path, cast_datetimes=False)
+    create_views_for_folder(con, cxr_jpg_path, cast_datetimes=False)
+    create_views_for_folder(con, note_path, cast_datetimes=True)
+
+    build_cxr_study_datetime(con, cxr_datetime_path)
     return con
 
 
@@ -192,9 +156,12 @@ def build_database(db_path, hosp_path, icu_path, cxr_path, cxr_jpg_path, note_pa
 def build_list_ids(con, list_ids_path):
     """Join ICU stays against CXR studies and clinical notes by subject,
     admission, and time window. Equivalent to the original pandasql query,
-    executed directly in DuckDB against the ingested tables."""
+    executed directly in DuckDB against views over the source files (plus
+    the small cxr_study_datetime derived view). icu_info/note_*_info are
+    query-only intermediates -- nothing here touches disk except the final
+    list_ids parquet, which is new derived data that doesn't exist yet."""
     con.execute("""
-        CREATE OR REPLACE TABLE icu_info AS
+        CREATE OR REPLACE VIEW icu_info AS
         SELECT
             i.subject_id, i.hadm_id, i.stay_id, i.intime, i.outtime,
             a.admittime, a.dischtime, a.edregtime, a.edouttime,
@@ -204,23 +171,22 @@ def build_list_ids(con, list_ids_path):
     """)
 
     con.execute("""
-        CREATE OR REPLACE TABLE note_ds_info AS
+        CREATE OR REPLACE VIEW note_ds_info AS
         SELECT note_id AS ds_note_id, subject_id, hadm_id, charttime AS ds_charttime
         FROM discharge
     """)
     con.execute("""
-        CREATE OR REPLACE TABLE note_rad_info AS
+        CREATE OR REPLACE VIEW note_rad_info AS
         SELECT note_id AS rad_note_id, subject_id, hadm_id, charttime AS rad_charttime
         FROM radiology
     """)
 
-    con.execute("""
-        CREATE OR REPLACE TABLE list_ids AS
+    list_ids_df = con.execute("""
         SELECT DISTINCT
             i.subject_id, i.hadm_id, i.stay_id,
             c.study_id, c.dicom_id, ds.ds_note_id, rad.rad_note_id
         FROM icu_info i
-        LEFT JOIN "mimic-cxr-2.0.0-metadata" c
+        LEFT JOIN cxr_study_datetime c
             ON i.subject_id = c.subject_id
             AND c.StudyDatetime >= i.earliest_intime AND c.StudyDatetime <= i.outtime
         LEFT JOIN note_ds_info ds
@@ -228,10 +194,11 @@ def build_list_ids(con, list_ids_path):
         LEFT JOIN note_rad_info rad
             ON i.subject_id = rad.subject_id AND i.hadm_id = rad.hadm_id
             AND rad.rad_charttime >= i.earliest_intime AND rad.rad_charttime <= i.outtime
-    """)
-    con.execute('CREATE INDEX IF NOT EXISTS idx_list_ids_keys ON list_ids (subject_id, hadm_id, stay_id)')
+    """).df()
 
-    con.execute(f"COPY list_ids TO '{Path(list_ids_path).as_posix()}' (FORMAT PARQUET)")
+    list_ids_path.parent.mkdir(parents=True, exist_ok=True)
+    list_ids_df.to_parquet(list_ids_path, index=False)
+    con.execute(f"CREATE OR REPLACE VIEW list_ids AS SELECT * FROM read_parquet('{list_ids_path.as_posix()}')")
 
     summary = con.execute("""
         SELECT
@@ -286,21 +253,49 @@ def _fetch_by_id_list(con, table, subject_col, subject_id, id_cols_and_lists):
 
 
 class DictionaryTables:
-    """Small reference tables loaded once as pandas and reused across every
-    patient (mirrors the original code's dfs_icu['d_items'].compute(), etc.)."""
+    """Small tables loaded ONCE as pandas and filtered in-memory per patient,
+    instead of querying DuckDB per patient. Two kinds live here:
+
+    - True dictionary/lookup tables (d_items, d_icd_diagnoses, ...) used for
+      merges onto every patient's event tables.
+    - Small per-patient tables (admissions, patients, icustays, transfers,
+      drgcodes, services) that are cheap enough to hold entirely in RAM
+      (~hundreds of thousands of rows, tens of MB) -- for these, pandas
+      boolean masking on an already-loaded DataFrame beats issuing 30,000+
+      separate DuckDB queries, each of which pays fixed per-query overhead.
+
+    Large per-event tables (chartevents, labevents, inputevents, etc.) are
+    NOT loaded here -- they stay as DuckDB views queried per patient, since
+    they're too large to comfortably fit in memory all at once.
+    """
 
     def __init__(self, con):
+        # Dictionary/lookup tables
         self.d_items = con.execute('SELECT * FROM d_items').df()
         self.d_icd_diagnoses = con.execute('SELECT * FROM d_icd_diagnoses').df()
         self.d_icd_procedures = con.execute('SELECT * FROM d_icd_procedures').df()
         self.d_labitems = con.execute('SELECT * FROM d_labitems').df()
         self.d_hcpcs = con.execute('SELECT * FROM d_hcpcs').df()
 
+        # Small per-patient tables -- loaded once, filtered in pandas per stay
+        self.admissions = con.execute('SELECT * FROM admissions').df()
+        self.patients = con.execute('SELECT * FROM patients').df()
+        self.icustays = con.execute('SELECT * FROM icustays').df()
+        self.transfers = con.execute('SELECT * FROM transfers').df()
+        self.drgcodes = con.execute('SELECT * FROM drgcodes').df()
+        self.services = con.execute('SELECT * FROM services').df()
+
 
 def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
-    """Build one Patient_ICU instance for a single ICU stay via indexed
-    DuckDB lookups. Output structure matches the original Patient_ICU
-    exactly; only the retrieval mechanism (SQL vs. dask filtering) changed."""
+    """Build one Patient_ICU instance for a single ICU stay.
+
+    Small tables (admissions, patients, icustays, transfers, drgcodes,
+    services, list_ids' own dictionary lookups) are filtered in pandas
+    against DictionaryTables, already preloaded once in memory. Large
+    per-event tables (chartevents, labevents, etc.) are queried per patient
+    against DuckDB views over the source parquet/csv.gz files, since they're
+    too large to hold fully in memory. Output structure matches the
+    original Patient_ICU exactly."""
 
     df_core = _fetch(con, "list_ids", "subject_id = ? AND hadm_id = ? AND stay_id = ?",
                       [key_subject_id, key_hadm_id, key_stay_id])
@@ -308,9 +303,13 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
     hosp_where = "subject_id = ? AND hadm_id = ?"
     hosp_params = [key_subject_id, key_hadm_id]
 
-    df_admissions = _fetch(con, "admissions", hosp_where, hosp_params)
-    df_patients = _fetch(con, "patients", "subject_id = ?", [key_subject_id])
-    df_transfers = _fetch(con, "transfers", hosp_where, hosp_params)
+    df_admissions = dicts.admissions[
+        (dicts.admissions.subject_id == key_subject_id) & (dicts.admissions.hadm_id == key_hadm_id)
+    ]
+    df_patients = dicts.patients[dicts.patients.subject_id == key_subject_id]
+    df_transfers = dicts.transfers[
+        (dicts.transfers.subject_id == key_subject_id) & (dicts.transfers.hadm_id == key_hadm_id)
+    ]
 
     df_diagnoses_icd = _fetch(con, "diagnoses_icd", hosp_where, hosp_params)
     df_diagnoses_icd = df_diagnoses_icd.merge(dicts.d_icd_diagnoses, how="left", on=["icd_code", "icd_version"])
@@ -318,8 +317,12 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
     df_procedures_icd = _fetch(con, "procedures_icd", hosp_where, hosp_params)
     df_procedures_icd = df_procedures_icd.merge(dicts.d_icd_procedures, how="left", on=["icd_code", "icd_version"])
 
-    df_drgcodes = _fetch(con, "drgcodes", hosp_where, hosp_params)
-    df_services = _fetch(con, "services", hosp_where, hosp_params)
+    df_drgcodes = dicts.drgcodes[
+        (dicts.drgcodes.subject_id == key_subject_id) & (dicts.drgcodes.hadm_id == key_hadm_id)
+    ]
+    df_services = dicts.services[
+        (dicts.services.subject_id == key_subject_id) & (dicts.services.hadm_id == key_hadm_id)
+    ]
 
     df_labevents = _fetch(con, "labevents", hosp_where, hosp_params)
     df_labevents = df_labevents.merge(dicts.d_labitems, how="left", on="itemid")
@@ -344,7 +347,11 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
     icu_where = "subject_id = ? AND hadm_id = ? AND stay_id = ?"
     icu_params = [key_subject_id, key_hadm_id, key_stay_id]
 
-    df_icustays = _fetch(con, "icustays", icu_where, icu_params)
+    df_icustays = dicts.icustays[
+        (dicts.icustays.subject_id == key_subject_id)
+        & (dicts.icustays.hadm_id == key_hadm_id)
+        & (dicts.icustays.stay_id == key_stay_id)
+    ]
     df_procedureevents = _fetch(con, "procedureevents", icu_where, icu_params).merge(dicts.d_items, how="left", on="itemid")
     df_outputevents = _fetch(con, "outputevents", icu_where, icu_params).merge(dicts.d_items, how="left", on="itemid")
     df_inputevents = _fetch(con, "inputevents", icu_where, icu_params).merge(dicts.d_items, how="left", on="itemid")
@@ -363,10 +370,20 @@ def get_patient_icustay(con, dicts, key_subject_id, key_hadm_id, key_stay_id):
         con, "cxr-study-list", "subject_id", key_subject_id,
         [("study_id", study_id_list)],
     )
-    df_cxr_metadata = _fetch_by_id_list(
-        con, "mimic-cxr-2.0.0-metadata", "subject_id", key_subject_id,
-        [("study_id", study_id_list), ("dicom_id", dicom_id_list)],
-    )
+    study_ids = [v for v in pd.unique(study_id_list) if pd.notna(v)]
+    dicom_ids = [v for v in pd.unique(dicom_id_list) if pd.notna(v)]
+    if study_ids and dicom_ids:
+        placeholders_s = ", ".join(["?"] * len(study_ids))
+        placeholders_d = ", ".join(["?"] * len(dicom_ids))
+        df_cxr_metadata = con.execute(f"""
+            SELECT m.*, d.StudyDatetime
+            FROM "mimic-cxr-2.0.0-metadata" m
+            LEFT JOIN cxr_study_datetime d
+                ON m.subject_id = d.subject_id AND m.study_id = d.study_id AND m.dicom_id = d.dicom_id
+            WHERE m.subject_id = ? AND m.study_id IN ({placeholders_s}) AND m.dicom_id IN ({placeholders_d})
+        """, [key_subject_id] + study_ids + dicom_ids).df()
+    else:
+        df_cxr_metadata = con.execute('SELECT *, NULL AS StudyDatetime FROM "mimic-cxr-2.0.0-metadata" WHERE 1=0').df()
     df_cxr_chexpert = _fetch_by_id_list(
         con, "mimic-cxr-2.0.0-chexpert", "subject_id", key_subject_id,
         [("study_id", study_id_list)],
@@ -428,14 +445,14 @@ def parse_args():
     parser.add_argument("--cxr-path", required=True, type=Path)
     parser.add_argument("--cxr-jpg-path", required=True, type=Path)
     parser.add_argument("--note-path", required=True, type=Path)
-    parser.add_argument("--db-path", required=True, type=Path,
-                         help="DuckDB database file to create/reuse.")
     parser.add_argument("--output-dir", required=True, type=Path,
                          help="Directory to write one ICUstay_<stay_id>.pkl per ICU stay.")
-    parser.add_argument("--list-ids-path", default="list_ids.parquet", type=Path,
-                         help="Where to save the subject/admission/stay <-> CXR/note ID mapping.")
-    parser.add_argument("--rebuild-db", action="store_true",
-                         help="Re-ingest source folders even if --db-path already exists.")
+    parser.add_argument("--list-ids-path", default=Path("list_ids.parquet"), type=Path,
+                         help="Where to save the subject/admission/stay <-> CXR/note ID mapping "
+                              "(new derived data -- not a copy of any source file).")
+    parser.add_argument("--cxr-datetime-path", default=Path("cxr_study_datetime.parquet"), type=Path,
+                         help="Where to save the derived CXR StudyDatetime column + keys "
+                              "(new derived data -- not a copy of the CXR metadata file).")
     parser.add_argument("--rebuild-list-ids", action="store_true",
                          help="Recompute list_ids even if --list-ids-path already exists.")
     parser.add_argument("--start-index", type=int, default=0,
@@ -448,21 +465,15 @@ def parse_args():
 def main():
     args = parse_args()
 
-    db_exists = args.db_path.exists()
-    if db_exists and not args.rebuild_db:
-        log.info("Reusing existing DuckDB database at %s", args.db_path)
-        con = duckdb.connect(str(args.db_path))
-    else:
-        log.info("Building DuckDB database at %s", args.db_path)
-        con = build_database(
-            args.db_path, args.hosp_path, args.icu_path,
-            args.cxr_path, args.cxr_jpg_path, args.note_path,
-        )
+    log.info("Registering views over source files (no data copied)")
+    con = register_views(
+        args.hosp_path, args.icu_path, args.cxr_path, args.cxr_jpg_path, args.note_path,
+        args.cxr_datetime_path,
+    )
 
     if args.list_ids_path.exists() and not args.rebuild_list_ids:
         log.info("Reusing existing list_ids at %s", args.list_ids_path)
-        con.execute(f"CREATE OR REPLACE TABLE list_ids AS SELECT * FROM read_parquet('{args.list_ids_path.as_posix()}')")
-        con.execute('CREATE INDEX IF NOT EXISTS idx_list_ids_keys ON list_ids (subject_id, hadm_id, stay_id)')
+        con.execute(f"CREATE OR REPLACE VIEW list_ids AS SELECT * FROM read_parquet('{args.list_ids_path.as_posix()}')")
     else:
         log.info("Building list_ids")
         build_list_ids(con, args.list_ids_path)
