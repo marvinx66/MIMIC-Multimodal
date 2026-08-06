@@ -62,6 +62,17 @@ def compare_dataframes(df_a, df_b, name):
     return False, "content differs (fingerprint mismatch) — needs detailed diff"
 
 
+def _to_pandas_if_dask(val):
+    """Compute a dask DataFrame/Series to pandas; pass through everything else."""
+    try:
+        import dask.dataframe as dd
+        if isinstance(val, (dd.DataFrame, dd.Series)):
+            return val.compute()
+    except ImportError:
+        pass
+    return val
+
+
 def compare_patient_icu(a, b, verbose=True):
     """Compare every attribute of two Patient_ICU instances."""
     attrs_a, attrs_b = vars(a), vars(b)
@@ -75,6 +86,10 @@ def compare_patient_icu(a, b, verbose=True):
             report[attr] = (False, "missing in B"); continue
 
         val_a, val_b = attrs_a[attr], attrs_b[attr]
+
+        # Materialize any lazy dask objects to pandas before comparing
+        val_a = _to_pandas_if_dask(val_a)
+        val_b = _to_pandas_if_dask(val_b)
 
         if isinstance(val_a, pd.DataFrame) or isinstance(val_b, pd.DataFrame):
             ok, msg = compare_dataframes(val_a, val_b, attr)
@@ -97,8 +112,18 @@ def compare_patient_icu(a, b, verbose=True):
     return report
 
 if __name__ == "__main__":
-    path1 = Path("~\OneDrive - University of Wollongong\PickleFilesForCheck\ICUstay_39553978.pkl").expanduser()
-    path2 = Path("~\MIMICWorkspace\MasterDataset\ICUstay_39553978.pkl").expanduser()
+    # windows
+    # path1 = Path("~\OneDrive - University of Wollongong\PickleFilesForCheck\ICUstay_39553978.pkl").expanduser()
+    
+    # macos
+    # path1 = Path("~/Library/CloudStorage/OneDrive-UniversityofWollongong/PickleFilesForCheck/ICUstay_39553978.pkl").expanduser()
+    # path2 = Path("~/Library/CloudStorage/OneDrive-UniversityofWollongong/PickleFilesForCheck/ICUstay_39553978.pkl").expanduser()
+
+    path1 = Path("~/Library/CloudStorage/OneDrive-UniversityofWollongong/PickleFilesForCheck/v1/ICUstay_39553978.pkl").expanduser()
+    path2 = Path("~/Library/CloudStorage/OneDrive-UniversityofWollongong/PickleFilesForCheck/v2/ICUstay_35773308.pkl").expanduser()
+    
+    # path1 = Path("~/MIMICWorkspace/MasterDataset/ICUstay_39553978.pkl").expanduser()
+    # path2 = Path("~/MIMICWorkspace/MasterDataset/ICUstay_39553978.pkl").expanduser()
 
     # Check by file hash
     # hash1, hash2 = check_by_file_hash(path1, path2)

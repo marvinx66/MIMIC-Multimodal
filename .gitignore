@@ -1,2 +1,7 @@
 **/*.pyc
 **/_pycache_
+.DS_Store
+scripts/path1_refs.txt
+scripts/path2_refs.txt
+/C:
+.DS_Store

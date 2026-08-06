@@ -1,0 +1,130 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Legacy:Data Processing Pipeline",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/1_2 Data Processing Pipeline.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--input-path", "${env:HOME}/MIMICWorkspace/PickleFilesForCheck/v2",
+        "--output-pkl-path", "${env:HOME}/MIMICWorkspace/PickleFilesForCheck/v2/processed_icu_24h.pkl",
+        "--output-csv-path", "${env:HOME}/MIMICWorkspace/PickleFilesForCheck/v2/metadata_24h.csv",
+        "--age-lower", "18",
+        "--start-diff", "0",
+        "--end-diff", "24"
+      ]
+    },    
+    {
+      "name": "Generate Master Dataset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/generate_master_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--hosp-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/hosp/",
+        "--icu-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/icu/",
+        "--cxr-path", "${env:HOME}/MIMICWorkspace/MIMIC-CXR/2.1.0/",
+        "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
+        "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
+        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset/"
+      ]
+    },
+    {
+      "name": "Generate Master Dataset (debug: first 10 stays)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/generate_master_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--hosp-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/hosp/",
+        "--icu-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/icu/",
+        "--cxr-path", "${env:HOME}/MIMICWorkspace/MIMIC-CXR/2.1.0/",
+        "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
+        "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
+        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_debug/",
+        "--end-index", "10"
+      ]
+    },
+    {
+      "name": "Step 1: Generate Master Dataset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/step1_generate_master_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--hosp-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/hosp/",
+        "--icu-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/icu/",
+        "--cxr-path", "${env:HOME}/MIMICWorkspace/MIMIC-CXR/2.1.0/",
+        "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
+        "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
+        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_0805/",
+      ]
+    },
+    {
+      "name": "Step 1: Generate Master Dataset (debug: first 10 stays)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/step1_generate_master_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--hosp-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/hosp/",
+        "--icu-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Parquet/physionet.org/files/mimiciv/3.1/icu/",
+        "--cxr-path", "${env:HOME}/MIMICWorkspace/MIMIC-CXR/2.1.0/",
+        "--cxr-jpg-path", "${env:HOME}/MIMICWorkspace/mimic-cxr-jpg/2.1.0/",
+        "--note-path", "${env:HOME}/MIMICWorkspace/MIMIC-IV-Note-Parquet/mimic-iv-note-deidentified-free-text-clinical-notes-2.2/note/",
+        "--output-dir", "${env:HOME}/MIMICWorkspace/MasterDataset_debug/",
+        "--debug-limit", "100",
+        "--overwrite"
+      ]
+    },  
+    {
+      "name": "Step 2: Generate Training Dataset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/step2_generate_training_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--input-dir",
+        "${env:HOME}/MIMICWorkspace/MasterDataset/",
+        "--output-dir",
+        "${env:HOME}/MIMICWorkspace/TrainingDataset_24h/",
+        "--age-lower",
+        "18",
+        "--start-diff",
+        "0",
+        "--end-diff",
+        "24"
+      ]
+    },
+    {
+      "name": "Step 2: Generate Training Dataset (debug: first 10 stays)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/01_duckdb_process/step2_generate_training_dataset.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--input-dir",
+        "${env:HOME}/MIMICWorkspace/MasterDataset_debug/",
+        "--output-dir",
+        "${env:HOME}/MIMICWorkspace/TrainingDataset_debug/",
+        "--age-lower",
+        "18",
+        "--start-diff",
+        "0",
+        "--end-diff",
+        "24",
+        "--debug-limit",
+        "100"
+      ]
+    }
+  ]
+}
